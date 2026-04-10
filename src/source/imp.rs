@@ -418,14 +418,21 @@ async fn run_session(
 	config.tls.disable_verify = Some(settings.tls_disable_verify);
 
 	let origin = moq_lite::Origin::produce();
-	let origin_consumer = origin.consume();
+	let mut origin_consumer = origin.consume();
 	let client = config.init()?.with_consume(origin);
 
 	let _session = client.connect(settings.url.clone()).await?;
 
-	let broadcast = origin_consumer
-		.consume_broadcast(&settings.broadcast)
-		.ok_or_else(|| anyhow::anyhow!("Broadcast '{}' not found", settings.broadcast))?;
+	// Wait for the broadcast to be announced by the relay.
+	let broadcast = loop {
+		match origin_consumer.announced().await {
+			Some((path, Some(broadcast))) if path.as_ref() == settings.broadcast.as_str() => {
+				break broadcast;
+			}
+			Some(_) => continue,
+			None => bail!("Connection closed while waiting for broadcast '{}'", settings.broadcast),
+		}
+	};
 
 	let catalog_track = broadcast.subscribe_track(&hang::catalog::Catalog::default_track())?;
 	let mut catalog = hang::catalog::CatalogConsumer::new(catalog_track);

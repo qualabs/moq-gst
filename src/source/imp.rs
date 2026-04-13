@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 
@@ -153,6 +154,7 @@ pub struct MoqSrc {
 	control_task: Mutex<Option<glib::JoinHandle<()>>>,
 	control_sender: Mutex<Option<mpsc::UnboundedSender<ControlMessage>>>,
 	session: Mutex<Option<SessionController>>,
+	async_pending: AtomicBool,
 }
 
 #[glib::object_subclass]
@@ -252,14 +254,12 @@ impl ElementImpl for MoqSrc {
 					gst::error!(CAT, obj = self.obj(), "failed to start session: {err:?}");
 					return Err(gst::StateChangeError);
 				}
-				let success = self.parent_change_state(transition)?;
-				let result = match success {
-					gst::StateChangeSuccess::Async => gst::StateChangeSuccess::Async,
-					_ => gst::StateChangeSuccess::NoPreroll,
-				};
-				Ok(result)
+				self.parent_change_state(transition)?;
+				self.async_pending.store(true, Ordering::SeqCst);
+				Ok(gst::StateChangeSuccess::Async)
 			}
 			gst::StateChange::PausedToReady => {
+				self.async_pending.store(false, Ordering::SeqCst);
 				self.stop_session();
 				self.parent_change_state(transition)
 			}
@@ -315,6 +315,12 @@ impl MoqSrc {
 		*self.control_sender.lock().unwrap() = None;
 	}
 
+	fn take_async_pending(&self) -> bool {
+		self.async_pending
+			.compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+			.is_ok()
+	}
+
 	fn handle_control_message(&self, msg: ControlMessage) {
 		match msg {
 			ControlMessage::CreatePad {
@@ -328,8 +334,16 @@ impl MoqSrc {
 			}
 			ControlMessage::NoMorePads => {
 				self.obj().no_more_pads();
+				if self.take_async_pending() {
+					if let Err(err) = self.obj().continue_state(gst::StateChangeReturn::NoPreroll) {
+						gst::warning!(CAT, obj = self.obj(), "continue_state failed: {err:?}");
+					}
+				}
 			}
 			ControlMessage::ReportError(err) => {
+				if self.take_async_pending() {
+					self.obj().abort_state();
+				}
 				gst::element_error!(self.obj(), gst::CoreError::Failed, ("session error"), ["{err:?}"]);
 			}
 		}
@@ -423,7 +437,6 @@ async fn run_session(
 
 	let _session = client.connect(settings.url.clone()).await?;
 
-	// Wait for the broadcast to be announced by the relay.
 	let broadcast = loop {
 		match origin_consumer.announced().await {
 			Some((path, Some(broadcast))) if path.as_ref() == settings.broadcast.as_str() => {

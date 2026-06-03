@@ -27,6 +27,7 @@ struct Settings {
 	broadcast: Option<String>,
 	tls_disable_verify: bool,
 	max_latency_ms: u64,
+	ascending: bool,
 }
 
 impl Default for Settings {
@@ -36,6 +37,7 @@ impl Default for Settings {
 			broadcast: None,
 			tls_disable_verify: false,
 			max_latency_ms: 1000,
+			ascending: false,
 		}
 	}
 }
@@ -46,6 +48,7 @@ struct ResolvedSettings {
 	broadcast: String,
 	tls_disable_verify: bool,
 	max_latency_ms: u64,
+	ascending: bool,
 }
 
 impl TryFrom<Settings> for ResolvedSettings {
@@ -61,6 +64,7 @@ impl TryFrom<Settings> for ResolvedSettings {
 				.clone(),
 			tls_disable_verify: value.tls_disable_verify,
 			max_latency_ms: value.max_latency_ms,
+			ascending: value.ascending,
 		})
 	}
 }
@@ -206,6 +210,11 @@ impl ObjectImpl for MoqSrc {
 					.minimum(0)
 					.maximum(u32::MAX as u64)
 					.build(),
+				glib::ParamSpecBoolean::builder("ascending")
+					.nick("Ascending group order")
+					.blurb("Deliver groups oldest-first (ascending=true) instead of newest-first (default)")
+					.default_value(false)
+					.build(),
 			]
 		});
 		PROPS.as_ref()
@@ -218,6 +227,7 @@ impl ObjectImpl for MoqSrc {
 			"broadcast" => settings.broadcast = value.get().unwrap(),
 			"tls-disable-verify" => settings.tls_disable_verify = value.get().unwrap(),
 			"max-latency-ms" => settings.max_latency_ms = value.get().unwrap(),
+			"ascending" => settings.ascending = value.get().unwrap(),
 			_ => unreachable!(),
 		}
 	}
@@ -229,6 +239,7 @@ impl ObjectImpl for MoqSrc {
 			"broadcast" => settings.broadcast.to_value(),
 			"tls-disable-verify" => settings.tls_disable_verify.to_value(),
 			"max-latency-ms" => settings.max_latency_ms.to_value(),
+			"ascending" => settings.ascending.to_value(),
 			_ => unreachable!(),
 		}
 	}
@@ -483,7 +494,9 @@ async fn run_session(
 		};
 		let caps = video_caps(&config)?;
 		let endpoint = request_pad(&control_tx, descriptor.clone(), caps).await?;
-		let track_ref = moq_lite::Track::new(&track_name);
+		let mut track_ref = moq_lite::Track::new(&track_name);
+		#[cfg(feature = "group-order")]
+		{ track_ref.ordered = settings.ascending; }
 		let track_consumer = broadcast.subscribe_track(&track_ref)?;
 		let track = hang::container::OrderedConsumer::new(track_consumer, Duration::from_millis(settings.max_latency_ms));
 		tasks.push(spawn_track_pump(track, descriptor, endpoint, shutdown.clone()));
@@ -496,7 +509,9 @@ async fn run_session(
 		};
 		let caps = audio_caps(&config)?;
 		let endpoint = request_pad(&control_tx, descriptor.clone(), caps).await?;
-		let track_ref = moq_lite::Track::new(&track_name);
+		let mut track_ref = moq_lite::Track::new(&track_name);
+		#[cfg(feature = "group-order")]
+		{ track_ref.ordered = settings.ascending; }
 		let track_consumer = broadcast.subscribe_track(&track_ref)?;
 		let track = hang::container::OrderedConsumer::new(track_consumer, Duration::from_millis(settings.max_latency_ms));
 		tasks.push(spawn_track_pump(track, descriptor, endpoint, shutdown.clone()));

@@ -27,6 +27,7 @@ struct Settings {
 	broadcast: Option<String>,
 	tls_disable_verify: bool,
 	max_latency_ms: u64,
+	ascending: bool,
 }
 
 impl Default for Settings {
@@ -36,6 +37,7 @@ impl Default for Settings {
 			broadcast: None,
 			tls_disable_verify: false,
 			max_latency_ms: 1000,
+			ascending: false,
 		}
 	}
 }
@@ -46,6 +48,7 @@ struct ResolvedSettings {
 	broadcast: String,
 	tls_disable_verify: bool,
 	max_latency_ms: u64,
+	ascending: bool,
 }
 
 impl TryFrom<Settings> for ResolvedSettings {
@@ -61,6 +64,7 @@ impl TryFrom<Settings> for ResolvedSettings {
 				.clone(),
 			tls_disable_verify: value.tls_disable_verify,
 			max_latency_ms: value.max_latency_ms,
+			ascending: value.ascending,
 		})
 	}
 }
@@ -201,10 +205,15 @@ impl ObjectImpl for MoqSrc {
 					.build(),
 				glib::ParamSpecUInt64::builder("max-latency-ms")
 					.nick("Max latency (ms)")
-					.blurb("OrderedConsumer max_latency: drop groups older than this when the span exceeds it")
+					.blurb("Drop groups older than this to stay at the live edge. Ignored when ascending=true.")
 					.default_value(1000)
 					.minimum(0)
 					.maximum(u32::MAX as u64)
+					.build(),
+				glib::ParamSpecBoolean::builder("ascending")
+					.nick("Ascending delivery")
+					.blurb("Deliver groups oldest-first (ascending); default false delivers newest-first (descending, live edge)")
+					.default_value(false)
 					.build(),
 			]
 		});
@@ -218,6 +227,7 @@ impl ObjectImpl for MoqSrc {
 			"broadcast" => settings.broadcast = value.get().unwrap(),
 			"tls-disable-verify" => settings.tls_disable_verify = value.get().unwrap(),
 			"max-latency-ms" => settings.max_latency_ms = value.get().unwrap(),
+			"ascending" => settings.ascending = value.get().unwrap(),
 			_ => unreachable!(),
 		}
 	}
@@ -229,6 +239,7 @@ impl ObjectImpl for MoqSrc {
 			"broadcast" => settings.broadcast.to_value(),
 			"tls-disable-verify" => settings.tls_disable_verify.to_value(),
 			"max-latency-ms" => settings.max_latency_ms.to_value(),
+			"ascending" => settings.ascending.to_value(),
 			_ => unreachable!(),
 		}
 	}
@@ -297,6 +308,15 @@ impl MoqSrc {
 			let settings = self.settings.lock().unwrap().clone();
 			ResolvedSettings::try_from(settings)?
 		};
+
+		gst::info!(
+			CAT,
+			"moqsrc start_session: url={} broadcast={} max_latency_ms={} ascending={}",
+			settings.url,
+			settings.broadcast,
+			settings.max_latency_ms,
+			settings.ascending,
+		);
 
 		let (control_tx, control_rx) = mpsc::unbounded_channel();
 		let obj = self.obj();
@@ -474,6 +494,8 @@ async fn run_session(
 	let mut catalog = hang::catalog::CatalogConsumer::new(catalog_track);
 	let catalog = catalog.next().await?.context("catalog missing")?.clone();
 
+	let consumer_latency = Duration::from_millis(settings.max_latency_ms);
+
 	let mut tasks = Vec::new();
 
 	for (track_name, config) in catalog.video.renditions {
@@ -483,9 +505,11 @@ async fn run_session(
 		};
 		let caps = video_caps(&config)?;
 		let endpoint = request_pad(&control_tx, descriptor.clone(), caps).await?;
-		let track_ref = moq_lite::Track::new(&track_name);
+		let mut track_ref = moq_lite::Track::new(&track_name);
+		#[cfg(feature = "group-order")]
+		{ track_ref.ordered = settings.ascending; }
 		let track_consumer = broadcast.subscribe_track(&track_ref)?;
-		let track = hang::container::OrderedConsumer::new(track_consumer, Duration::from_millis(settings.max_latency_ms));
+		let track = hang::container::OrderedConsumer::new(track_consumer, consumer_latency);
 		tasks.push(spawn_track_pump(track, descriptor, endpoint, shutdown.clone()));
 	}
 
@@ -496,9 +520,11 @@ async fn run_session(
 		};
 		let caps = audio_caps(&config)?;
 		let endpoint = request_pad(&control_tx, descriptor.clone(), caps).await?;
-		let track_ref = moq_lite::Track::new(&track_name);
+		let mut track_ref = moq_lite::Track::new(&track_name);
+		#[cfg(feature = "group-order")]
+		{ track_ref.ordered = settings.ascending; }
 		let track_consumer = broadcast.subscribe_track(&track_ref)?;
-		let track = hang::container::OrderedConsumer::new(track_consumer, Duration::from_millis(settings.max_latency_ms));
+		let track = hang::container::OrderedConsumer::new(track_consumer, consumer_latency);
 		tasks.push(spawn_track_pump(track, descriptor, endpoint, shutdown.clone()));
 	}
 
@@ -556,8 +582,10 @@ async fn run_track_pump(
 					Ok(Some(frame)) => {
 						let timestamp = frame.timestamp;
 						let is_keyframe = frame.is_keyframe();
+						let group_seq = frame.group;
 						let payload = frame.payload;
-						let mut buffer = gst::Buffer::from_slice(payload.into_iter().flatten().collect::<Vec<_>>());
+						let payload_bytes: Vec<u8> = payload.into_iter().flatten().collect();
+						let mut buffer = gst::Buffer::from_slice(payload_bytes);
 						let buffer_mut = buffer.get_mut().unwrap();
 
 						let pts = match reference_ts {
